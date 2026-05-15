@@ -16,6 +16,10 @@ export async function sendLED(baseUrl: string, state: "on" | "off") {
   return sendControl(baseUrl, { led: state });
 }
 
+export async function sendESP32Command(baseUrl: string, direction: "left" | "right" | "center") {
+  return sendControl(baseUrl, { servo: direction });
+}
+
 export async function checkHeartbeat(baseUrl: string): Promise<{
   alive: boolean;
   uptime?: number;

@@ -68,6 +68,7 @@ function usePhoneCamera(active: boolean) {
   return { videoRef, error, loading };
 }
 
+
 // ============================================
 // OVERLAY COMPONENTS
 // ============================================
@@ -170,7 +171,7 @@ function DisconnectOverlay() {
 // ============================================
 function CameraView({
   settings, scene, espConnected, gpsSpeed,
-  onReport, mediaRef, inferenceMs, modelLoaded, onCameraError,
+  onReport, mediaRef, inferenceMs, modelLoaded, onCameraError, onESPStreamReady,
 }: {
   settings: AppSettings; scene: AppScene; espConnected: boolean;
   gpsSpeed: number;
@@ -178,23 +179,49 @@ function CameraView({
   mediaRef: React.MutableRefObject<HTMLVideoElement | HTMLImageElement | null>;
   inferenceMs: number; modelLoaded: boolean;
   onCameraError: (hasError: boolean) => void;
+  onESPStreamReady: (live: boolean) => void;
 }) {
   const isESP32 = settings.cameraSource === "esp32";
   const phoneCam = usePhoneCamera(!isESP32);
-  const imgRef = useRef<HTMLImageElement>(null);
-  const [streamError, setStreamError] = useState(false);
   const config = SCENES[scene];
 
+  // ESP32 stream state — dead simple
+  const espImgRef = useRef<HTMLImageElement>(null);
+  const [espLive, setEspLive] = useState(false);
+  const [espError, setEspError] = useState(false);
+  const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Simple reconnect: just set a new src with cache-buster
+  const espReconnect = useCallback(() => {
+    if (reconnectRef.current) clearTimeout(reconnectRef.current);
+    reconnectRef.current = setTimeout(() => {
+      if (espImgRef.current) {
+        espImgRef.current.src = `${settings.esp32Url}:81/stream?t=${Date.now()}`;
+      }
+    }, 3000);
+  }, [settings.esp32Url]);
+
+  // Cleanup reconnect timer on unmount
+  useEffect(() => {
+    return () => { if (reconnectRef.current) clearTimeout(reconnectRef.current); };
+  }, []);
+
+  // Notify parent when ESP32 stream state changes
+  useEffect(() => {
+    if (isESP32) onESPStreamReady(espLive);
+  }, [espLive, isESP32]);
+
+  // Keep mediaRef pointing to the correct element for detection
   useEffect(() => {
     if (isESP32) {
-      mediaRef.current = imgRef.current;
+      mediaRef.current = espImgRef.current;
     } else {
       mediaRef.current = phoneCam.videoRef.current;
     }
     onCameraError(!!phoneCam.error);
   });
 
-  const showDisconnect = (isESP32 && streamError) || (!isESP32 && !!phoneCam.error);
+  const showDisconnect = (isESP32 && espError) || (!isESP32 && !!phoneCam.error);
 
   return (
     <div className="flex-1 min-h-0 flex flex-col px-3 pt-2 pb-1">
@@ -207,10 +234,11 @@ function CameraView({
         )}
 
         {isESP32 && (
-          <img ref={imgRef} src={`${settings.esp32Url}:81/stream`}
-            alt="ESP32 camera" crossOrigin="anonymous"
-            onError={() => setStreamError(true)}
-            onLoad={() => setStreamError(false)}
+          <img ref={espImgRef}
+            src={`${settings.esp32Url}:81/stream`}
+            alt="ESP32 camera"
+            onLoad={() => { setEspLive(true); setEspError(false); }}
+            onError={() => { setEspLive(false); setEspError(true); espReconnect(); }}
             style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
         )}
 
@@ -221,9 +249,17 @@ function CameraView({
         <StatusDots detections={config.detections} />
         <CameraInfoBar
           gpsSpeed={gpsSpeed} inferenceMs={inferenceMs} modelLoaded={modelLoaded}
-          cameraLabel={isESP32 ? (espConnected ? "ESP32" : "OFF") : (!phoneCam.error ? "PHONE" : "ERR")} />
+          cameraLabel={isESP32 ? (espLive ? "ESP32" : espError ? "OFF" : "...") : (!phoneCam.error ? "PHONE" : "ERR")} />
 
         {showDisconnect && <DisconnectOverlay />}
+        {isESP32 && !espLive && !espError && (
+          <div className="absolute inset-0 z-[20] flex flex-col items-center justify-center"
+            style={{ background: "rgba(0,0,0,0.85)", borderRadius: 12 }}>
+            <div className="animate-spin w-10 h-10 border-3 border-[#22d3ee33] border-t-[#22d3ee] rounded-full mb-3" />
+            <span style={{ fontSize: 14, fontWeight: 500, color: "#22d3ee" }}>Connecting to ESP32-CAM...</span>
+            <span style={{ fontSize: 11, color: "#555", marginTop: 4 }}>{settings.esp32Url}</span>
+          </div>
+        )}
       </div>
 
       <div className="flex items-center justify-center gap-3 py-3">
@@ -618,14 +654,15 @@ export default function PotholeNetApp() {
   );
 
   const [phoneCamError, setPhoneCamError] = useState(false);
+  const [espStreamLive, setEspStreamLive] = useState(false);
 
-  // Derive scene from detections
+  // Derive scene from detections — use ACTUAL stream state, not heartbeat
   useEffect(() => {
     if (tab !== "camera") return;
-    const cameraOk = isESP32 ? espConnected : !phoneCamError;
+    const cameraOk = isESP32 ? espStreamLive : !phoneCamError;
     const derived = deriveAlertState(detections, gpsSpeed, !cameraOk);
     setScene(derived);
-  }, [detections, gpsSpeed, espConnected, isESP32, tab, phoneCamError]);
+  }, [detections, gpsSpeed, espStreamLive, isESP32, tab, phoneCamError]);
 
   useAudioCues(scene, settings.soundsEnabled, settings.voiceCuesEnabled);
   useVibration(scene, settings.hapticsEnabled);
@@ -679,14 +716,14 @@ export default function PotholeNetApp() {
           }}>
             {backendHealth ? "SERVER ✓" : "SERVER ✗"}
           </span>
-          {/* Camera status */}
+          {/* Camera status — uses ACTUAL stream state, not heartbeat */}
           <span style={{
             fontSize: 10, fontWeight: 500, padding: "2px 8px", borderRadius: 4,
-            background: espConnected || !isESP32 ? "#22c55e18" : "#ef444418",
-            color: espConnected || !isESP32 ? "#22c55e" : "#ef4444",
-            border: `1px solid ${espConnected || !isESP32 ? "#22c55e33" : "#ef444433"}`,
+            background: (isESP32 ? espStreamLive : true) ? "#22c55e18" : "#ef444418",
+            color: (isESP32 ? espStreamLive : true) ? "#22c55e" : "#ef4444",
+            border: `1px solid ${(isESP32 ? espStreamLive : true) ? "#22c55e33" : "#ef444433"}`,
           }}>
-            {isESP32 ? (espConnected ? "ESP32 LIVE" : "ESP32 OFF") : "PHONE CAM"}
+            {isESP32 ? (espStreamLive ? "ESP32 LIVE" : "ESP32 OFF") : "PHONE CAM"}
           </span>
           {/* GPS status */}
           <span style={{
@@ -703,7 +740,8 @@ export default function PotholeNetApp() {
       {tab === "camera" && (
         <CameraView settings={settings} scene={scene} espConnected={espConnected}
           mediaRef={detectTargetRef} inferenceMs={inferenceMs} modelLoaded={modelLoaded}
-          gpsSpeed={gpsSpeed} onReport={handleReport} onCameraError={setPhoneCamError} />
+          gpsSpeed={gpsSpeed} onReport={handleReport} onCameraError={setPhoneCamError}
+          onESPStreamReady={setEspStreamLive} />
       )}
       {tab === "map" && (
         <MapView

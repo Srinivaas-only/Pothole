@@ -1,22 +1,22 @@
 /*
  * ============================================================
- *  PotholeNet ESP32-CAM Firmware v2.0
- *  Access Point Mode — AI-Thinker ESP32-CAM (built-in USB)
+ *  PotholeNet ESP32-CAM Firmware v3.0
+ *  Station Mode — AI-Thinker ESP32-CAM (built-in USB)
  * ============================================================
  *
  * WHAT IT DOES:
- *   - Creates a Wi-Fi hotspot (Access Point mode)
- *   - Phone connects to the ESP32's Wi-Fi network
+ *   - Connects to your home Wi-Fi network (Station mode)
+ *   - All devices (phone, server, ESP32) on the same network
  *   - Streams live camera feed as MJPEG
  *   - Provides single-frame capture for ML detection
- *   - LED flash control, camera settings
+ *   - LED flash control, servo control, camera settings
  *   - Captive portal auto-redirects phone to status page
  *
  * ENDPOINTS:
  *   http://192.168.4.1/              → Status page (HTML)
  *   http://192.168.4.1:81/stream     → MJPEG live stream
-  *   http://192.168.4.1/capture       → Single JPEG capture
- *   http://192.168.4.1/control       → Control (LED, camera)
+ *   http://192.168.4.1/capture       → Single JPEG capture
+ *   http://192.168.4.1/control       → Control (LED, servo, camera)
  *   http://192.168.4.1/heartbeat     → JSON status for app
  *   http://192.168.4.1/status        → Detailed JSON diagnostics
  *
@@ -34,36 +34,37 @@
  *      release once upload begins
  *
  * AFTER FLASHING:
- *   - ESP32 creates its own Wi-Fi hotspot (configurable SSID in secrets.h)
- *   - Connect your phone to this Wi-Fi network
- *   - A captive portal page should auto-appear, or browse to 192.168.4.1
- *   - Open the PotholeNet app — it auto-detects the ESP32 stream
+ *   - Edit secrets.h with your home Wi-Fi SSID and password
+ *   - ESP32 connects to your Wi-Fi network automatically
+ *   - Open Serial Monitor to see the assigned IP address
+ *   - Access via http://potholenet.local or the IP shown in Serial
+ *   - Phone and server must be on the same Wi-Fi network
  *
  * POWER NOTES:
  *   - ESP32-CAM needs stable 5V / 1A+ power supply
  *   - If camera init fails (brown-out), add a 1000µF cap across 5V/GND
- *   - Flash LED draws significant current — use sparingly
  */
 
 #include "esp_camera.h"
 #include <WiFi.h>
-#include <WebServer.h>
-#include <DNSServer.h>
+#include <ESPmDNS.h>
 #include "esp_http_server.h"
-#include "secrets.h"       // SSID & password — copy secrets.h.example to secrets.h and edit
+#include "secrets.h"       // Wi-Fi SSID & password — copy secrets.h.example to secrets.h and edit
 
 // =========================
 // CONFIGURATION
 // =========================
 const int   AP_CHANNEL  = 6;          // Wi-Fi channel (1-13)
 const int   MAX_CLIENTS = 4;          // Max connected devices
+const int   SERVO_PIN   = 12;         // GPIO12 — only free pin on AI-Thinker
+const bool  ENABLE_SERVO = false;     // Set true if servo is connected
 const int   LED_PIN     = 4;          // Built-in flash LED
 
 // Stream settings
 const int   STREAM_PORT = 81;         // MJPEG stream port
 const int   CONTROL_PORT = 80;        // HTTP control port
 const int   JPEG_QUALITY = 10;        // 0-63, lower = better quality
-const framesize_t FRAME_SIZE = FRAMESIZE_VGA; // Default: 640x480
+const int   FRAME_SIZE = FRAMESIZE_VGA; // Default: 640x480
 
 // =========================
 // AI-THINKER ESP32-CAM PIN MAP
@@ -90,10 +91,14 @@ const framesize_t FRAME_SIZE = FRAMESIZE_VGA; // Default: 640x480
 // =========================
 httpd_handle_t stream_httpd  = NULL;
 httpd_handle_t control_httpd = NULL;
-DNSServer dnsServer;
 bool cameraReady = false;
 unsigned long bootTime = 0;
 int streamClients = 0;
+
+// Servo
+#include <ESP32Servo.h>
+Servo myServo;
+int servoAngle = 90;  // Center
 
 // MJPEG boundary
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -117,6 +122,10 @@ static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
+  IPAddress ip = WiFi.localIP();
+  char ipStr[16];
+  snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+
   char html[2048];
   snprintf(html, sizeof(html),
     "<!DOCTYPE html><html><head>"
@@ -134,46 +143,43 @@ static esp_err_t index_handler(httpd_req_t *req) {
     ".btn{display:inline-block;background:#22c55e;color:#000;padding:10px 20px;border-radius:8px;"
     "font-weight:bold;margin:8px 4px;text-decoration:none}"
     ".btn:hover{background:#16a34a}"
-    ".grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}"
     "img{width:100%%;border-radius:8px;margin-top:8px}"
     "</style></head><body>"
     "<h1>&#128663; PotholeNet ESP32-CAM</h1>"
 
     "<div class='card'>"
     "<div class='label'>Status</div>"
-    "<div class='value'>&#9989; Online &mdash; Camera %s</div>"
+    "<div class='value'>&#9989; Online &mdash; Camera %s &mdash; Wi-Fi Connected</div>"
     "</div>"
 
     "<div class='card'>"
     "<div class='label'>Live Stream</div>"
-    "<div class='value'><a href='http://192.168.4.1:81/stream'>http://192.168.4.1:81/stream</a></div>"
-    "<img src='http://192.168.4.1/capture' alt='Camera feed'>"
-    "</div>"
-
-    "<div class='card grid'>"
-    "<div><div class='label'>Flash LED</div>"
-    "<a href='/control?led=on' class='btn' style='background:#f59e0b'>ON</a>"
-    "<a href='/control?led=off' class='btn'>OFF</a></div>"
-    "<div><div class='label'>API Endpoints</div>"
-    "<div class='value' style='font-size:0.8rem'>/capture<br>/heartbeat<br>/status<br>/control</div></div>"
+    "<div class='value'><a href='http://%s:81/stream'>http://%s:81/stream</a></div>"
+    "<img src='http://%s/capture' alt='Camera feed'>"
     "</div>"
 
     "<div class='card'>"
-    "<div class='label'>Hardware</div>"
-    "<div class='value'>AI-Thinker ESP32-CAM<br>Mode: Wi-Fi AP<br>"
-    "SSID: %s<br>Heap: %d KB</div>"
+    "<div class='label'>API Endpoints</div>"
+    "<div class='value' style='font-size:0.8rem'>/capture<br>/heartbeat<br>/status<br>/control</div>"
+    "</div>"
+
+    "<div class='card'>"
+    "<div class='label'>Network</div>"
+    "<div class='value'>AI-Thinker ESP32-CAM<br>Mode: Wi-Fi Station<br>"
+    "SSID: %s<br>IP: %s<br>Heap: %d KB</div>"
     "</div>"
 
     "<div class='card'>"
     "<div class='label'>Open PotholeNet App</div>"
-    "<div class='value'>Connect your phone to <b>%s</b> Wi-Fi, then open the PotholeNet app.</div>"
+    "<div class='value'>Make sure your phone is on the same Wi-Fi network (<b>%s</b>), then open the PotholeNet app.</div>"
     "</div>"
 
     "</body></html>",
     cameraReady ? "Ready" : "FAILED",
-    AP_SSID,
+    ipStr, ipStr, ipStr,
+    WIFI_SSID, ipStr,
     ESP.getFreeHeap() / 1024,
-    AP_SSID
+    WIFI_SSID
   );
 
   httpd_resp_sendstr(req, html);
@@ -194,6 +200,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
   streamClients++;
   Serial.printf("[STREAM] Client connected (total: %d)\n", streamClients);
+
+  // FPS cap delay (milliseconds per frame)
+  const unsigned long frameDelay = 1000 / STREAM_FPS_CAP;
+  unsigned long lastFrame = millis();
 
   while (true) {
     fb = esp_camera_fb_get();
@@ -233,7 +243,13 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
     if (res != ESP_OK) break;
 
-    // Yield to watchdog
+    // FPS cap — wait if we're ahead of schedule
+    unsigned long now = millis();
+    unsigned long elapsed = now - lastFrame;
+    if (elapsed < frameDelay) {
+      delay(frameDelay - elapsed);
+    }
+    lastFrame = millis();
     taskYIELD();
   }
 
@@ -265,6 +281,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 // =========================
 // HANDLER: Control endpoint
 //   /control?led=on|off
+//   /control?servo=left|right|center  (or servo=N for angle 0-180)
 //   /control?brightness=N (-2 to 2)
 //   /control?contrast=N   (-2 to 2)
 //   /control?resolution=VGA|QVGA|CIF
@@ -288,6 +305,22 @@ static esp_err_t control_handler(httpd_req_t *req) {
       } else {
         digitalWrite(LED_PIN, LOW);
         Serial.println("[CTRL] LED OFF");
+      }
+    }
+
+    // Servo control
+    if (httpd_query_key_value(query, "servo", param, sizeof(param)) == ESP_OK) {
+      if (ENABLE_SERVO) {
+        int angle = servoAngle; // default current
+        if (strcmp(param, "left") == 0)  angle = 0;
+        else if (strcmp(param, "right") == 0) angle = 180;
+        else if (strcmp(param, "center") == 0) angle = 90;
+        else angle = atoi(param);  // numeric angle
+
+        angle = constrain(angle, 0, 180);
+        myServo.write(angle);
+        servoAngle = angle;
+        Serial.printf("[CTRL] Servo → %d°\n", angle);
       }
     }
 
@@ -363,9 +396,9 @@ static esp_err_t control_handler(httpd_req_t *req) {
 static esp_err_t heartbeat_handler(httpd_req_t *req) {
   char buf[128];
   snprintf(buf, sizeof(buf),
-    "{\"alive\":true,\"uptime\":%lu,\"clients\":%d,\"heap\":%lu,\"camera\":%s}",
+    "{\"alive\":true,\"uptime\":%lu,\"wifi_connected\":%s,\"heap\":%lu,\"camera\":%s}",
     (millis() - bootTime) / 1000,
-    WiFi.softAPgetStationNum(),
+    WiFi.status() == WL_CONNECTED ? "true" : "false",
     (unsigned long)ESP.getFreeHeap(),
     cameraReady ? "true" : "false"
   );
@@ -377,27 +410,36 @@ static esp_err_t heartbeat_handler(httpd_req_t *req) {
 // HANDLER: Detailed status (for diagnostics)
 // =========================
 static esp_err_t status_handler(httpd_req_t *req) {
+  IPAddress ip = WiFi.localIP();
+  char ipStr[16];
+  snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+
   char buf[512];
   snprintf(buf, sizeof(buf),
     "{"
-    "\"ip\":\"192.168.4.1\","
+    "\"ip\":\"%s\","
     "\"ssid\":\"%s\","
-    "\"clients\":%d,"
+    "\"wifi_connected\":%s,"
+    "\"rssi\":%d,"
     "\"uptime\":%lu,"
     "\"heap_free\":%lu,"
     "\"heap_min\":%lu,"
     "\"camera\":%s,"
     "\"stream_clients\":%d,"
+    "\"servo_angle\":%d,"
     "\"led\":%d,"
     "\"resolution\":\"VGA\""
     "}",
-    AP_SSID,
-    WiFi.softAPgetStationNum(),
+    ipStr,
+    WIFI_SSID,
+    WiFi.status() == WL_CONNECTED ? "true" : "false",
+    WiFi.RSSI(),
     (millis() - bootTime) / 1000,
     (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getMinFreeHeap(),
     cameraReady ? "true" : "false",
     streamClients,
+    servoAngle,
     digitalRead(LED_PIN) ? 1 : 0
   );
   send_json(req, buf);
@@ -466,16 +508,12 @@ void setup() {
   Serial.setDebugOutput(true);
   Serial.println("\n\n");
   Serial.println("╔══════════════════════════════════════╗");
-  Serial.println("║    PotholeNet ESP32-CAM  v2.0       ║");
-  Serial.println("║    Access Point Mode                 ║");
+  Serial.println("║    PotholeNet ESP32-CAM  v3.0       ║");
+  Serial.println("║    Station Mode (Wi-Fi Client)       ║");
   Serial.println("╚══════════════════════════════════════╝");
   Serial.println();
 
   bootTime = millis();
-
-  // LED pin
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
 
   // ── Camera init ──
   camera_config_t config;
@@ -522,11 +560,8 @@ void setup() {
     Serial.printf("[CAM] INIT FAILED (0x%x)\n", err);
     Serial.println("[CAM] Check wiring, power supply (5V/1A+), add 1000uF cap");
     cameraReady = false;
-    // Blink LED rapidly to indicate failure
-    while (true) {
-      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-      delay(200);
-    }
+    // Halt — camera is required
+    while (true) { delay(1000); }
   }
 
   cameraReady = true;
@@ -554,6 +589,13 @@ void setup() {
   s->set_lenc(s, 1);            // Lens correction
   s->set_dcw(s, 1);             // Downsize enable
 
+  // ── Servo init ──
+  if (ENABLE_SERVO) {
+    myServo.attach(SERVO_PIN, 500, 2400);
+    myServo.write(servoAngle);
+    Serial.println("[SERVO] Initialized on GPIO12");
+  }
+
   // ── Wi-Fi AP ──
   Serial.println("[WIFI] Starting Access Point...");
   WiFi.mode(WIFI_AP);
@@ -568,25 +610,18 @@ void setup() {
   Serial.println("╔══════════════════════════════════════╗");
   Serial.println("║  PotholeNet ESP32-CAM Ready!         ║");
   Serial.println("╠══════════════════════════════════════╣");
-  Serial.printf("║  SSID:     %-25s║\n", AP_SSID);
-  Serial.printf("║  Password: %-25s║\n", AP_PASSWORD);
+  Serial.printf("║  SSID:     %-25s║\n", WIFI_SSID);
   Serial.printf("║  IP:       %-25s║\n", IP.toString().c_str());
+  char mdnsStr[32];
+  snprintf(mdnsStr, sizeof(mdnsStr), "http://%s.local", MDNS_NAME);
+  Serial.printf("║  mDNS:     %-25s║\n", mdnsStr);
   Serial.printf("║  Stream:   http://%s:81/stream  ║\n", IP.toString().c_str());
   Serial.printf("║  Capture:  http://%s/capture     ║\n", IP.toString().c_str());
-  Serial.printf("║  Heartbeat: http://%s/heartbeat   ║\n", IP.toString().c_str());
   Serial.printf("║  Heap:     %-5lu bytes free        ║\n", (unsigned long)ESP.getFreeHeap());
   Serial.println("╚══════════════════════════════════════╝");
 
   // ── Start HTTP servers ──
   startServers();
-
-  // ── Ready indicator: 3 blinks ──
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(150);
-    digitalWrite(LED_PIN, LOW);
-    delay(150);
-  }
 
   Serial.println("[READY] System online. Waiting for connections...");
 }
@@ -595,28 +630,34 @@ void setup() {
 // LOOP
 // =========================
 void loop() {
-  // Process DNS requests for captive portal
-  dnsServer.processNextRequest();
-
-  // Heartbeat blink every 5 seconds
-  static unsigned long lastBlink = 0;
-  if (millis() - lastBlink > 5000) {
-    digitalWrite(LED_PIN, HIGH);
-    delay(30);
-    digitalWrite(LED_PIN, LOW);
-    lastBlink = millis();
-
-    // Periodic health log (every 30 seconds)
-    static unsigned long lastLog = 0;
-    if (millis() - lastLog > 30000) {
-      Serial.printf("[HEALTH] Heap: %lu KB | Clients: %d | Stream: %d | Uptime: %lu s\n",
-        (unsigned long)ESP.getFreeHeap() / 1024,
-        WiFi.softAPgetStationNum(),
-        streamClients,
-        (millis() - bootTime) / 1000
-      );
-      lastLog = millis();
+  // Wi-Fi reconnection check
+  static unsigned long lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 5000) {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiConnected) {
+        Serial.println("[WIFI] Connection lost! Reconnecting...");
+        wifiConnected = false;
+      }
+      WiFi.reconnect();
+    } else if (!wifiConnected) {
+      wifiConnected = true;
+      IPAddress IP = WiFi.localIP();
+      Serial.printf("[WIFI] Reconnected! IP: %s\n", IP.toString().c_str());
     }
+    lastWifiCheck = millis();
+  }
+
+  // Periodic health log (every 30 seconds)
+  static unsigned long lastLog = 0;
+  if (millis() - lastLog > 30000) {
+    Serial.printf("[HEALTH] Heap: %lu KB | WiFi: %s | RSSI: %d dBm | Stream: %d | Uptime: %lu s\n",
+      (unsigned long)ESP.getFreeHeap() / 1024,
+      WiFi.status() == WL_CONNECTED ? "OK" : "DOWN",
+      WiFi.RSSI(),
+      streamClients,
+      (millis() - bootTime) / 1000
+    );
+    lastLog = millis();
   }
 
   delay(10);  // Small delay to prevent watchdog issues
