@@ -62,14 +62,6 @@ GET /control?led=on     → Turn flash ON
 GET /control?led=off    → Turn flash OFF
 ```
 
-### Servo (if ENABLE_SERVO = true)
-```
-GET /control?servo=left    → 0°
-GET /control?center        → 90°
-GET /control?right         → 180°
-GET /control?servo=45      → Custom angle (0-180)
-```
-
 ### Camera Settings
 ```
 GET /control?brightness=1     → -2 to 2
@@ -85,17 +77,6 @@ GET /control?hmirror=0        → 0 or 1
 ```
 GET /control?brightness=1&contrast=2&led=on
 ```
-
-## Wiring
-
-### Servo Motor (optional)
-```
-Servo Signal  → GPIO 12
-Servo VCC    → 5V (external supply recommended)
-Servo GND    → GND
-```
-
-> ⚠️ The ESP32-CAM has very few free GPIO pins. GPIO 12 is the only reliably available one. **Do NOT use GPIO 0, 2, 4, 15, 16, 33** — they're used by the camera or boot config.
 
 ## Troubleshooting
 

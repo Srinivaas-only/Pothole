@@ -12,12 +12,11 @@ import { useAudioCues } from "./hooks/useAudioCues";
 import { useVibration } from "./hooks/useVibration";
 import { useWakeLock } from "./hooks/useWakeLock";
 import { useHazards } from "./hooks/useHazards";
-import { sendESP32Command } from "./lib/esp32";
 import { submitReport, checkHealth, updateLocation } from "./lib/api";
 import type { HazardItem, HealthResponse } from "./lib/api";
 import {
-  Camera, MapPin, Settings, ChevronLeft, AlertTriangle,
-  Crosshair, ChevronRight, RotateCcw, Radio, RadioOff,
+  Camera, MapPin, Settings, AlertTriangle,
+  RotateCcw, Radio, RadioOff,
   Zap, Eye, EyeOff, Volume2, VolumeX, Smartphone, Wifi,
   ChevronDown, X, Map, Server, WifiOff, Activity
 } from "lucide-react";
@@ -228,15 +227,9 @@ function CameraView({
       </div>
 
       <div className="flex items-center justify-center gap-3 py-3">
-        <ControlButton icon={<ChevronLeft size={20} />} label="Pan L"
-          onClick={() => sendESP32Command(settings.esp32Url, "left")} />
         <ControlButton icon={<AlertTriangle size={22} />} label="Report"
           primary onClick={onReport}
           style={{ borderColor: "#ef4444", color: "#ef4444" }} />
-        <ControlButton icon={<Crosshair size={20} />} label="Center"
-          onClick={() => sendESP32Command(settings.esp32Url, "center")} />
-        <ControlButton icon={<ChevronRight size={20} />} label="Pan R"
-          onClick={() => sendESP32Command(settings.esp32Url, "right")} />
       </div>
     </div>
   );

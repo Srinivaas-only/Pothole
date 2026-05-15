@@ -783,9 +783,6 @@ function BottomNav() {
           background: "#111",
         }}
       >
-        <button style={btnBase} onClick={() => flash("Servo → Left")} title="Aim left">
-          ‹
-        </button>
         <button
           style={{
             ...btnBase,
@@ -802,14 +799,8 @@ function BottomNav() {
         >
           ⚠
         </button>
-        <button style={btnBase} onClick={() => flash("Camera centered")} title="Center camera">
-          ◎
-        </button>
         <button style={btnBase} onClick={() => flash("Map view")} title="Map">
           ☰
-        </button>
-        <button style={btnBase} onClick={() => flash("Servo → Right")} title="Aim right">
-          ›
         </button>
       </div>
     </div>

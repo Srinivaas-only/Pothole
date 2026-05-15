@@ -9,14 +9,14 @@
  *   - Phone connects to the ESP32's Wi-Fi network
  *   - Streams live camera feed as MJPEG
  *   - Provides single-frame capture for ML detection
- *   - LED flash control, servo control, camera settings
+ *   - LED flash control, camera settings
  *   - Captive portal auto-redirects phone to status page
  *
  * ENDPOINTS:
  *   http://192.168.4.1/              → Status page (HTML)
  *   http://192.168.4.1:81/stream     → MJPEG live stream
- *   http://192.168.4.1/capture       → Single JPEG capture
- *   http://192.168.4.1/control       → Control (LED, servo, camera)
+  *   http://192.168.4.1/capture       → Single JPEG capture
+ *   http://192.168.4.1/control       → Control (LED, camera)
  *   http://192.168.4.1/heartbeat     → JSON status for app
  *   http://192.168.4.1/status        → Detailed JSON diagnostics
  *
@@ -57,15 +57,13 @@
 // =========================
 const int   AP_CHANNEL  = 6;          // Wi-Fi channel (1-13)
 const int   MAX_CLIENTS = 4;          // Max connected devices
-const int   SERVO_PIN   = 12;         // GPIO12 — only free pin on AI-Thinker
-const bool  ENABLE_SERVO = false;     // Set true if servo is connected
 const int   LED_PIN     = 4;          // Built-in flash LED
 
 // Stream settings
 const int   STREAM_PORT = 81;         // MJPEG stream port
 const int   CONTROL_PORT = 80;        // HTTP control port
 const int   JPEG_QUALITY = 10;        // 0-63, lower = better quality
-const int   FRAME_SIZE = FRAMESIZE_VGA; // Default: 640x480
+const framesize_t FRAME_SIZE = FRAMESIZE_VGA; // Default: 640x480
 
 // =========================
 // AI-THINKER ESP32-CAM PIN MAP
@@ -96,11 +94,6 @@ DNSServer dnsServer;
 bool cameraReady = false;
 unsigned long bootTime = 0;
 int streamClients = 0;
-
-// Servo
-#include <ESP32Servo.h>
-Servo myServo;
-int servoAngle = 90;  // Center
 
 // MJPEG boundary
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -272,7 +265,6 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 // =========================
 // HANDLER: Control endpoint
 //   /control?led=on|off
-//   /control?servo=left|right|center  (or servo=N for angle 0-180)
 //   /control?brightness=N (-2 to 2)
 //   /control?contrast=N   (-2 to 2)
 //   /control?resolution=VGA|QVGA|CIF
@@ -296,22 +288,6 @@ static esp_err_t control_handler(httpd_req_t *req) {
       } else {
         digitalWrite(LED_PIN, LOW);
         Serial.println("[CTRL] LED OFF");
-      }
-    }
-
-    // Servo control
-    if (httpd_query_key_value(query, "servo", param, sizeof(param)) == ESP_OK) {
-      if (ENABLE_SERVO) {
-        int angle = servoAngle; // default current
-        if (strcmp(param, "left") == 0)  angle = 0;
-        else if (strcmp(param, "right") == 0) angle = 180;
-        else if (strcmp(param, "center") == 0) angle = 90;
-        else angle = atoi(param);  // numeric angle
-
-        angle = constrain(angle, 0, 180);
-        myServo.write(angle);
-        servoAngle = angle;
-        Serial.printf("[CTRL] Servo → %d°\n", angle);
       }
     }
 
@@ -412,7 +388,6 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"heap_min\":%lu,"
     "\"camera\":%s,"
     "\"stream_clients\":%d,"
-    "\"servo_angle\":%d,"
     "\"led\":%d,"
     "\"resolution\":\"VGA\""
     "}",
@@ -423,7 +398,6 @@ static esp_err_t status_handler(httpd_req_t *req) {
     (unsigned long)ESP.getMinFreeHeap(),
     cameraReady ? "true" : "false",
     streamClients,
-    servoAngle,
     digitalRead(LED_PIN) ? 1 : 0
   );
   send_json(req, buf);
@@ -579,13 +553,6 @@ void setup() {
   s->set_raw_gma(s, 1);         // Raw gamma
   s->set_lenc(s, 1);            // Lens correction
   s->set_dcw(s, 1);             // Downsize enable
-
-  // ── Servo init ──
-  if (ENABLE_SERVO) {
-    myServo.attach(SERVO_PIN, 500, 2400);
-    myServo.write(servoAngle);
-    Serial.println("[SERVO] Initialized on GPIO12");
-  }
 
   // ── Wi-Fi AP ──
   Serial.println("[WIFI] Starting Access Point...");
