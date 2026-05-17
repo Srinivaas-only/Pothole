@@ -17,6 +17,10 @@ export interface Detection {
   bbox: [number, number, number, number];
   isHuman: boolean;
   isVehicle: boolean;
+  // True if this vehicle's bbox center shifted significantly vs the previous frame.
+  // Computed in useDetection by matching nearest previous detection. Only meaningful
+  // for vehicles; humans/potholes leave it undefined.
+  isMoving?: boolean;
 }
 
 export interface BBox {
@@ -45,6 +49,8 @@ export interface SceneConfig {
   showDisconnect: boolean;
 }
 
+export type StreamRotation = 0 | 90 | "auto";
+
 export interface AppSettings {
   cameraSource: CameraSource;
   esp32Url: string;
@@ -55,16 +61,21 @@ export interface AppSettings {
   wakeLockEnabled: boolean;
   detectionThreshold: number;
   useBackendDetection: boolean;
+  // 0 = native, 90 = clockwise 90°, "auto" = follow phone orientation
+  // (portrait → rotate 90°, landscape → native)
+  streamRotation: StreamRotation;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
-  cameraSource: "phone",
+  cameraSource: "esp32",
   esp32Url: "http://172.20.10.3",
-  backendUrl: "http://localhost:8000",
+  // Empty = use same-origin via Vite proxy (avoids mixed-content blocks on HTTPS).
+  backendUrl: "",
   soundsEnabled: true,
   voiceCuesEnabled: true,
   hapticsEnabled: true,
   wakeLockEnabled: true,
   detectionThreshold: 0.5,
   useBackendDetection: true,
+  streamRotation: "auto",
 };

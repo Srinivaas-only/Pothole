@@ -46,7 +46,7 @@ export const SCENES: Record<AppScene, SceneConfig> = {
     showDisconnect: false,
   },
   DISCONNECTED: {
-    alertLevel: "gray", alertLabel: "📵 NO CAMERA",
+    alertLevel: "gray", alertLabel: "",
     borderColor: "#666666", glowColor: "transparent", glowSpread: 0, pulse: "none",
     confColor: "#666666", detections: { pot: false, hum: false, veh: false }, bboxes: [],
     showDisconnect: true,

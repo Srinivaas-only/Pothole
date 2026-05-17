@@ -6,6 +6,44 @@ import { detectDualMode } from "../lib/api";
 
 type MediaElement = HTMLImageElement | HTMLVideoElement;
 
+// Motion detection — match each current vehicle to its nearest predecessor in
+// the previous frame and flag isMoving if the center shifted significantly.
+// Thresholds are fractions of the source frame's smaller dimension so they
+// scale across resolutions.
+const MATCH_FRACTION = 0.25;   // Max center distance to consider "same vehicle"
+const MOTION_FRACTION = 0.035; // Center shift above this = moving
+
+function center(b: [number, number, number, number]): [number, number] {
+  return [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+}
+
+function tagVehicleMotion(
+  current: Detection[],
+  previous: Detection[],
+  sourceW: number,
+  sourceH: number,
+): Detection[] {
+  const scale = Math.min(sourceW, sourceH) || 1;
+  const matchDist = scale * MATCH_FRACTION;
+  const motionDist = scale * MOTION_FRACTION;
+  const prevVehicles = previous.filter((d) => d.isVehicle);
+
+  return current.map((d) => {
+    if (!d.isVehicle) return d;
+    const [cx, cy] = center(d.bbox);
+    let bestDist = Infinity;
+    for (const p of prevVehicles) {
+      const [px, py] = center(p.bbox);
+      const dist = Math.hypot(cx - px, cy - py);
+      if (dist < bestDist) bestDist = dist;
+    }
+    // If nothing close enough matched, treat as a brand-new detection
+    // (not "moving" — we have no prior position to compare against).
+    const isMoving = bestDist <= matchDist && bestDist > motionDist;
+    return { ...d, isMoving };
+  });
+}
+
 export function useDetection(
   mediaRef: RefObject<MediaElement | null>,
   enabled: boolean,
@@ -16,7 +54,10 @@ export function useDetection(
   const [detections, setDetections] = useState<Detection[]>([]);
   const [inferenceMs, setInferenceMs] = useState(0);
   const [modelLoaded, setModelLoaded] = useState(false);
+  const [sourceWidth, setSourceWidth] = useState(640);
+  const [sourceHeight, setSourceHeight] = useState(480);
   const modelRef = useRef<any>(null);
+  const previousDetectionsRef = useRef<Detection[]>([]);
 
   // ── Local TF.js model loading (fallback) ──
   useEffect(() => {
@@ -130,55 +171,43 @@ export function useDetection(
             const elapsed = Math.round(performance.now() - start);
             if (!stopped) {
               setInferenceMs(elapsed);
+              setSourceWidth(w);
+              setSourceHeight(h);
 
-              // Convert backend response to Detection[] format
+              // Convert backend response to Detection[] format with [x1,y1,x2,y2] bboxes
               const filtered: Detection[] = [];
 
-              // Add human detections
-              for (const d of result.humans.details) {
+              const pushObj = (d: any, isHuman: boolean, isVehicle: boolean, fallback: string) => {
+                const box = (d.box ?? [0, 0, 0, 0]) as [number, number, number, number];
                 filtered.push({
-                  label: d.label || "person",
+                  label: d.label || fallback,
                   confidence: Math.round(d.confidence),
-                  bbox: [0, 0, 0, 0],
-                  isHuman: true,
-                  isVehicle: false,
+                  bbox: box,
+                  isHuman, isVehicle,
                 });
-              }
-              // Add vehicle detections
-              for (const d of result.vehicles.details) {
-                filtered.push({
-                  label: d.label || "vehicle",
-                  confidence: Math.round(d.confidence),
-                  bbox: [0, 0, 0, 0],
-                  isHuman: false,
-                  isVehicle: true,
-                });
-              }
-              // Add animal detections
-              for (const d of result.animals.details) {
-                filtered.push({
-                  label: d.label || "animal",
-                  confidence: Math.round(d.confidence),
-                  bbox: [0, 0, 0, 0],
-                  isHuman: false,
-                  isVehicle: false,
-                });
-              }
+              };
 
-              // Add pothole as a special detection (for scene logic)
+              for (const d of result.humans.details)   pushObj(d, true,  false, "person");
+              for (const d of result.vehicles.details) pushObj(d, false, true,  "vehicle");
+              for (const d of result.animals.details)  pushObj(d, false, false, "animal");
+
+              // Pothole bboxes from Roboflow are center-style (x, y, width, height) — convert to xyxy
               if (result.pothole.detected) {
                 for (const d of result.pothole.details) {
+                  const cx = d.x || 0, cy = d.y || 0;
+                  const pw = d.width || 0, ph = d.height || 0;
                   filtered.push({
                     label: "pothole",
                     confidence: Math.round(d.confidence),
-                    bbox: [d.x || 0, d.y || 0, d.width || 0, d.height || 0],
-                    isHuman: false,
-                    isVehicle: false,
+                    bbox: [cx - pw / 2, cy - ph / 2, cx + pw / 2, cy + ph / 2],
+                    isHuman: false, isVehicle: false,
                   });
                 }
               }
 
-              if (!stopped) setDetections(filtered);
+              const tagged = tagVehicleMotion(filtered, previousDetectionsRef.current, w, h);
+              previousDetectionsRef.current = tagged;
+              if (!stopped) setDetections(tagged);
             }
           }
         } catch (err) {
@@ -204,17 +233,29 @@ export function useDetection(
           const preds = await model.detect(el);
           setInferenceMs(Math.round(performance.now() - start));
 
+          // Source dims for overlay coordinate mapping
+          const sw = el instanceof HTMLImageElement ? (el.naturalWidth || 640) : (el.videoWidth || 640);
+          const sh = el instanceof HTMLImageElement ? (el.naturalHeight || 480) : (el.videoHeight || 480);
+          setSourceWidth(sw);
+          setSourceHeight(sh);
+
           const filtered: Detection[] = preds
             .filter((p: any) => p.score > threshold && VALID.includes(p.class))
-            .map((p: any) => ({
-              label: p.class,
-              confidence: Math.round(p.score * 100),
-              bbox: p.bbox as [number, number, number, number],
-              isHuman: isHumanDetection(p.class),
-              isVehicle: isVehicleDetection(p.class),
-            }));
+            .map((p: any) => {
+              // COCO-SSD returns [x, y, w, h] — convert to [x1, y1, x2, y2]
+              const [x, y, w, h] = p.bbox as [number, number, number, number];
+              return {
+                label: p.class,
+                confidence: Math.round(p.score * 100),
+                bbox: [x, y, x + w, y + h] as [number, number, number, number],
+                isHuman: isHumanDetection(p.class),
+                isVehicle: isVehicleDetection(p.class),
+              };
+            });
 
-          if (!stopped) setDetections(filtered);
+          const tagged = tagVehicleMotion(filtered, previousDetectionsRef.current, sw, sh);
+          previousDetectionsRef.current = tagged;
+          if (!stopped) setDetections(tagged);
         } catch {
           // inference error — skip frame
         }
@@ -233,5 +274,5 @@ export function useDetection(
     return () => { stopped = true; };
   }, [mediaRef, enabled, modelLoaded, threshold, useBackend, gpsSpeed]);
 
-  return { detections, inferenceMs, modelLoaded };
+  return { detections, inferenceMs, modelLoaded, sourceWidth, sourceHeight };
 }

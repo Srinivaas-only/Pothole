@@ -1,18 +1,20 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import type { AppScene, AppSettings, TabView, CameraSource } from "./types";
+import type { AppScene, AppSettings, TabView, CameraSource, Detection } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { SCENES } from "./constants/scenes";
 import { ALERT_COLORS } from "./constants/colors";
-import { deriveAlertState } from "./lib/alertLogic";
+import { deriveAlertState, deriveEdgeColor } from "./lib/alertLogic";
+import type { EdgeAlertColor, EdgeAlertState } from "./lib/alertLogic";
 import { useESPHeartbeat } from "./hooks/useESPHeartbeat";
+import { useOrientation } from "./hooks/useOrientation";
 import { useGPS } from "./hooks/useGPS";
 import { useDetection } from "./hooks/useDetection";
 import { useAudioCues } from "./hooks/useAudioCues";
 import { useVibration } from "./hooks/useVibration";
 import { useWakeLock } from "./hooks/useWakeLock";
 import { useHazards } from "./hooks/useHazards";
-import { submitReport, checkHealth, updateLocation } from "./lib/api";
+import { submitReport, checkHealth, updateLocation, clearDemoHazards } from "./lib/api";
 import type { HazardItem, HealthResponse } from "./lib/api";
 import {
   Camera, MapPin, Settings, AlertTriangle,
@@ -20,6 +22,8 @@ import {
   Zap, Eye, EyeOff, Volume2, VolumeX, Smartphone, Wifi,
   ChevronDown, X, Map, Server, WifiOff, Activity
 } from "lucide-react";
+import { HazardMap } from "./components/HazardMap";
+import { SAMPLE_HAZARDS, SAMPLE_CENTER } from "./constants/sampleHazards";
 
 // ============================================
 // CAMERA HOOK — Phone + ESP32
@@ -43,6 +47,16 @@ function usePhoneCamera(active: boolean) {
     let cancelled = false;
     setLoading(true);
     setError(null);
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError(
+        window.isSecureContext
+          ? "Camera unavailable"
+          : "Phone camera needs HTTPS — switch to ESP32 in Settings"
+      );
+      setLoading(false);
+      return;
+    }
 
     navigator.mediaDevices.getUserMedia({
       video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } },
@@ -155,14 +169,83 @@ function StatusTag({ label, value, color }: { label: string; value: string; colo
   );
 }
 
-function DisconnectOverlay() {
+function EdgeAlert({ state }: { state: EdgeAlertState }) {
+  const hexByColor: Record<EdgeAlertColor, string> = {
+    red:    "#ef4444",
+    orange: "#f59e0b",
+    green:  "#22c55e",
+  };
+  const hex = hexByColor[state.color];
   return (
-    <div className="absolute inset-0 z-[20] flex flex-col items-center justify-center"
-      style={{ background: "rgba(0,0,0,0.92)", borderRadius: 12 }}>
-      <Camera size={48} className="text-[#444] mb-4" />
-      <span style={{ fontSize: 16, fontWeight: 500, color: "#777" }}>No Camera</span>
-      <span style={{ fontSize: 12, color: "#444", marginTop: 6 }}>Connect a camera or check settings</span>
-    </div>
+    <div
+      className={state.pulse ? "pulse-fast" : ""}
+      style={{
+        position: "fixed",
+        inset: 0,
+        pointerEvents: "none",
+        zIndex: 9999,
+        border: `6px solid ${hex}`,
+        boxShadow: `inset 0 0 36px 10px ${hex}80`,
+        borderRadius: 4,
+        transition: "border-color 0.3s ease, box-shadow 0.3s ease",
+      }}
+    />
+  );
+}
+
+function detectionColor(d: Detection): string {
+  if (d.label === "pothole") return "#ef4444";
+  if (d.isHuman) return "#f59e0b";
+  if (d.isVehicle) return "#22d3ee";
+  return "#22c55e";
+}
+
+function DetectionOverlay({
+  detections, sourceWidth, sourceHeight, rotation = 0,
+}: { detections: Detection[]; sourceWidth: number; sourceHeight: number; rotation?: 0 | 90 }) {
+  if (!detections.length || sourceWidth <= 0 || sourceHeight <= 0) return null;
+  const rotationTransform = rotation === 90
+    ? { transform: "rotate(90deg)", transformOrigin: "center center" }
+    : {};
+  return (
+    <svg
+      viewBox={`0 0 ${sourceWidth} ${sourceHeight}`}
+      preserveAspectRatio="xMidYMid slice"
+      style={{
+        position: "absolute", inset: 0, width: "100%", height: "100%",
+        pointerEvents: "none", zIndex: 4,
+        ...rotationTransform,
+      }}
+    >
+      {detections.map((d, i) => {
+        const [x1, y1, x2, y2] = d.bbox;
+        const w = Math.max(0, x2 - x1);
+        const h = Math.max(0, y2 - y1);
+        if (w <= 0 || h <= 0) return null;
+        const color = detectionColor(d);
+        const motionTag = d.isVehicle && d.isMoving ? " · MOVING" : "";
+        const labelText = `${d.label} ${d.confidence}%${motionTag}`;
+        // Scale font with source resolution so it stays readable after SVG scaling
+        const fontSize = Math.max(12, Math.round(sourceHeight / 28));
+        const padX = Math.round(fontSize * 0.4);
+        const padY = Math.round(fontSize * 0.25);
+        const tagH = fontSize + padY * 2;
+        const tagW = labelText.length * fontSize * 0.55 + padX * 2;
+        const tagY = Math.max(0, y1 - tagH);
+        return (
+          <g key={i}>
+            <rect x={x1} y={y1} width={w} height={h}
+              fill="none" stroke={color} strokeWidth={Math.max(2, sourceHeight / 240)} />
+            <rect x={x1} y={tagY} width={tagW} height={tagH} fill={color} opacity={0.92} />
+            <text x={x1 + padX} y={tagY + tagH - padY - 1}
+              fontSize={fontSize} fontFamily="system-ui, -apple-system, sans-serif"
+              fontWeight={700} fill="#000">
+              {labelText}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
   );
 }
 
@@ -172,6 +255,7 @@ function DisconnectOverlay() {
 function CameraView({
   settings, scene, espConnected, gpsSpeed,
   onReport, mediaRef, inferenceMs, modelLoaded, onCameraError, onESPStreamReady,
+  detections, sourceWidth, sourceHeight,
 }: {
   settings: AppSettings; scene: AppScene; espConnected: boolean;
   gpsSpeed: number;
@@ -180,16 +264,42 @@ function CameraView({
   inferenceMs: number; modelLoaded: boolean;
   onCameraError: (hasError: boolean) => void;
   onESPStreamReady: (live: boolean) => void;
+  detections: Detection[]; sourceWidth: number; sourceHeight: number;
 }) {
   const isESP32 = settings.cameraSource === "esp32";
   const phoneCam = usePhoneCamera(!isESP32);
   const config = SCENES[scene];
+  const orientation = useOrientation();
+
+  // Resolve "auto" using live phone orientation: portrait → rotate 90°,
+  // landscape → native. Manual values pass through unchanged.
+  const effectiveRotation: 0 | 90 =
+    settings.streamRotation === "auto"
+      ? (orientation === "portrait" ? 90 : 0)
+      : settings.streamRotation;
+
+  const rotationStyle: React.CSSProperties =
+    effectiveRotation === 90
+      ? { transform: "rotate(90deg)", transformOrigin: "center center" }
+      : {};
 
   // ESP32 stream state — dead simple
   const espImgRef = useRef<HTMLImageElement>(null);
   const [espLive, setEspLive] = useState(false);
   const [espError, setEspError] = useState(false);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Track whether we've EVER seen a heartbeat success in this CameraView life.
+  // Once true, any future espConnected=false means a real disconnect, not just
+  // an initial probe in progress. This is the reliable signal — Safari sometimes
+  // doesn't fire <img> onError on MJPEG stream drop, leaving the last frame frozen.
+  const hasEverConnectedRef = useRef(false);
+  useEffect(() => {
+    if (espConnected) hasEverConnectedRef.current = true;
+  }, [espConnected]);
+
+  const espDisconnected =
+    isESP32 && (espError || (hasEverConnectedRef.current && !espConnected));
 
   // Simple reconnect: just set a new src with cache-buster
   const espReconnect = useCallback(() => {
@@ -221,8 +331,6 @@ function CameraView({
     onCameraError(!!phoneCam.error);
   });
 
-  const showDisconnect = (isESP32 && espError) || (!isESP32 && !!phoneCam.error);
-
   return (
     <div className="flex-1 min-h-0 flex flex-col px-3 pt-2 pb-1">
       <div className="relative flex-1 min-h-0 rounded-xl overflow-hidden bg-[#111]"
@@ -230,34 +338,75 @@ function CameraView({
 
         {!isESP32 && (
           <video ref={phoneCam.videoRef} autoPlay playsInline muted
-            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", ...rotationStyle }} />
         )}
 
         {isESP32 && (
           <img ref={espImgRef}
             src={`${settings.esp32Url}:81/stream`}
             alt="ESP32 camera"
+            crossOrigin="anonymous"
             onLoad={() => { setEspLive(true); setEspError(false); }}
             onError={() => { setEspLive(false); setEspError(true); espReconnect(); }}
-            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", ...rotationStyle }} />
         )}
 
+        <DetectionOverlay
+          detections={detections}
+          sourceWidth={sourceWidth}
+          sourceHeight={sourceHeight}
+          rotation={effectiveRotation}
+        />
         <AlertBorder config={config} />
         <AnimatePresence mode="wait">
-          <AlertBanner text={config.alertLabel} color={config.alertLevel} />
+          {config.alertLabel && (
+            <AlertBanner text={config.alertLabel} color={config.alertLevel} />
+          )}
         </AnimatePresence>
         <StatusDots detections={config.detections} />
         <CameraInfoBar
           gpsSpeed={gpsSpeed} inferenceMs={inferenceMs} modelLoaded={modelLoaded}
           cameraLabel={isESP32 ? (espLive ? "ESP32" : espError ? "OFF" : "...") : (!phoneCam.error ? "PHONE" : "ERR")} />
 
-        {showDisconnect && <DisconnectOverlay />}
-        {isESP32 && !espLive && !espError && (
+        {isESP32 && !espLive && !espError && !espDisconnected && (
           <div className="absolute inset-0 z-[20] flex flex-col items-center justify-center"
             style={{ background: "rgba(0,0,0,0.85)", borderRadius: 12 }}>
             <div className="animate-spin w-10 h-10 border-3 border-[#22d3ee33] border-t-[#22d3ee] rounded-full mb-3" />
             <span style={{ fontSize: 14, fontWeight: 500, color: "#22d3ee" }}>Connecting to ESP32-CAM...</span>
             <span style={{ fontSize: 11, color: "#555", marginTop: 4 }}>{settings.esp32Url}</span>
+          </div>
+        )}
+
+        {/* DISCONNECT OVERLAY — red diagonal stripes, fully covers the (now stale) frame */}
+        {espDisconnected && (
+          <div
+            className="absolute inset-0 z-[25] flex flex-col items-center justify-center pulse-slow"
+            style={{
+              background:
+                "repeating-linear-gradient(45deg, rgba(20,20,20,0.96) 0px, rgba(20,20,20,0.96) 36px, rgba(239,68,68,0.88) 36px, rgba(239,68,68,0.88) 58px)",
+              borderRadius: 12,
+            }}
+          >
+            <div
+              style={{
+                background: "rgba(0,0,0,0.85)",
+                padding: "18px 28px",
+                borderRadius: 12,
+                border: "2px solid #ef4444",
+                boxShadow: "0 6px 24px rgba(0,0,0,0.6)",
+                textAlign: "center",
+              }}
+            >
+              <div style={{ fontSize: 22, fontWeight: 800, color: "#ef4444", letterSpacing: "0.06em" }}>
+                ⚠ ESP32 DISCONNECTED
+              </div>
+              <div style={{ fontSize: 12, color: "#aaa", marginTop: 8 }}>
+                Stream lost · auto-retrying every 3s
+              </div>
+              <div style={{ fontSize: 10, color: "#666", marginTop: 4 }}>
+                {settings.esp32Url}
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -296,22 +445,85 @@ function ControlButton({ icon, label, onClick, primary, style }: {
 // ============================================
 // MAP VIEW — Now with REAL hazard data from backend
 // ============================================
-function MapView({ gpsSpeed, hazards, nearbyCount, totalReports, loading }: {
+function MapView({ gpsSpeed, gpsCoords, gpsStatus, hazards, nearbyCount, totalReports, loading, onRefetch }: {
   gpsSpeed: number;
+  gpsCoords: { lat: number; lng: number } | null;
+  gpsStatus: "idle" | "acquiring" | "locked" | "denied";
   hazards: HazardItem[];
   nearbyCount: number;
   totalReports: number;
   loading: boolean;
+  onRefetch: () => void;
 }) {
-  const closestHazard = hazards.length > 0 ? hazards[0] : null;
+  // Fall back to sample data when there's nothing real to show — guarantees
+  // the map is populated for the demo regardless of GPS / backend state.
+  const isSampleMode = hazards.length === 0;
+  const displayHazards = isSampleMode ? SAMPLE_HAZARDS : hazards;
+  const mapCenter: [number, number] | null = gpsCoords
+    ? [gpsCoords.lat, gpsCoords.lng]
+    : (isSampleMode ? SAMPLE_CENTER : null);
+
+  const closestHazard = displayHazards.length > 0 ? displayHazards[0] : null;
+  const [seedBusy, setSeedBusy] = useState<"" | "clear">("");
+  const [seedMsg, setSeedMsg] = useState("");
+
+  const flashMsg = (m: string) => {
+    setSeedMsg(m);
+    setTimeout(() => setSeedMsg(""), 3500);
+  };
+
+  const handleClear = async () => {
+    setSeedBusy("clear");
+    try {
+      const r = await clearDemoHazards();
+      flashMsg(`✓ Cleared ${r.deleted} markers`);
+      onRefetch();
+    } catch (e: any) {
+      flashMsg(`✗ Clear failed: ${e?.message || e}`);
+    } finally {
+      setSeedBusy("");
+    }
+  };
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto flex flex-col items-center px-4 py-3 gap-3">
+    <div className="flex-1 min-h-0 flex flex-col px-3 pt-2 pb-1 gap-2">
+      {/* Live Leaflet map */}
+      <div className="w-full" style={{ flex: "1 1 55%", minHeight: 260 }}>
+        <HazardMap gpsCoords={gpsCoords} hazards={displayHazards} initialCenter={mapCenter} />
+      </div>
+
+      {/* Scrollable info panel */}
+      <div className="w-full overflow-y-auto flex flex-col items-center gap-3" style={{ flex: "1 1 45%" }}>
+
+      {/* Demo controls */}
+      <div className="w-full max-w-sm rounded-xl bg-[#111] border border-[#222] p-3">
+        {gpsStatus !== "locked" && (
+          <div className="text-[#f59e0b] text-xs mb-2 leading-snug">
+            ⚠ GPS {gpsStatus} — tap <b>Allow Location</b> in Safari when prompted (HTTPS is required, which you already have).
+          </div>
+        )}
+        {gpsStatus === "locked" && gpsCoords && (
+          <div className="text-[#22c55e] text-xs mb-2">
+            ✓ GPS locked at {gpsCoords.lat.toFixed(5)}, {gpsCoords.lng.toFixed(5)}
+          </div>
+        )}
+        <button
+          onClick={handleClear}
+          disabled={seedBusy !== ""}
+          className="w-full text-xs font-semibold py-2 px-3 rounded-lg disabled:opacity-40"
+          style={{ background: "#1a1a1a", color: "#ef4444", border: "1px solid #ef444433" }}
+        >
+          {seedBusy === "clear" ? "Clearing…" : "Clear"}
+        </button>
+        {seedMsg && (
+          <div className="text-[#ccc] text-xs mt-2">{seedMsg}</div>
+        )}
+      </div>
+
       {/* Summary card */}
-      <div className="w-full max-w-sm rounded-xl overflow-hidden bg-[#111] border border-[#222] p-5 text-center">
-        <Map size={40} className="text-[#22d3ee] mx-auto mb-3" />
-        <h2 className="text-white text-lg font-semibold mb-1">Hazard Map</h2>
-        <p className="text-[#666] text-xs mb-4">
+      <div className="w-full max-w-sm rounded-xl overflow-hidden bg-[#111] border border-[#222] p-4 text-center">
+        <h2 className="text-white text-base font-semibold mb-1">Hazard Map</h2>
+        <p className="text-[#666] text-xs mb-3">
           Live pothole reports near your location
         </p>
         <div className="flex justify-center gap-6 text-sm">
@@ -351,10 +563,17 @@ function MapView({ gpsSpeed, hazards, nearbyCount, totalReports, loading }: {
       )}
 
       {/* Hazard list */}
-      {hazards.length > 0 && (
+      {displayHazards.length > 0 && (
         <div className="w-full max-w-sm space-y-2">
-          <h3 className="text-[#888] text-xs font-semibold uppercase tracking-wider">All Nearby Hazards</h3>
-          {hazards.slice(0, 10).map((h, i) => (
+          <h3 className="text-[#888] text-xs font-semibold uppercase tracking-wider flex items-center justify-between">
+            <span>All Nearby Hazards</span>
+            {isSampleMode && (
+              <span className="text-[10px] font-medium normal-case text-[#22d3ee] bg-[#22d3ee18] border border-[#22d3ee33] rounded px-2 py-0.5 tracking-normal">
+                SAMPLE DATA
+              </span>
+            )}
+          </h3>
+          {displayHazards.slice(0, 10).map((h, i) => (
             <div key={h.report_id} className="bg-[#111] border border-[#222] rounded-lg p-3 flex items-center gap-3">
               <div className="w-8 h-8 rounded-full bg-[#ef444418] flex items-center justify-center text-[#ef4444] text-xs font-bold">
                 {i + 1}
@@ -373,9 +592,10 @@ function MapView({ gpsSpeed, hazards, nearbyCount, totalReports, loading }: {
         </div>
       )}
 
-      {!loading && hazards.length === 0 && (
+      {!loading && displayHazards.length === 0 && (
         <div className="text-[#555] text-xs py-4">No hazards nearby — road is clear!</div>
       )}
+      </div>
     </div>
   );
 }
@@ -422,6 +642,34 @@ function SettingsView({ settings, onUpdate, backendHealth }: {
               }} />
           </SettingsGroup>
         )}
+
+        {/* Stream rotation toggle */}
+        <SettingsGroup title="Stream Rotation">
+          <div className="flex gap-2">
+            <SourceButton
+              icon={<RotateCcw size={18} style={{ opacity: 0.4 }} />}
+              label="Original"
+              active={settings.streamRotation === 0}
+              onClick={() => onUpdate({ ...settings, streamRotation: 0 })}
+            />
+            <SourceButton
+              icon={<RotateCcw size={18} style={{ transform: "scaleX(-1)" }} />}
+              label="90° ↻"
+              active={settings.streamRotation === 90}
+              onClick={() => onUpdate({ ...settings, streamRotation: 90 })}
+            />
+            <SourceButton
+              icon={<Smartphone size={18} />}
+              label="Auto"
+              active={settings.streamRotation === "auto"}
+              onClick={() => onUpdate({ ...settings, streamRotation: "auto" })}
+            />
+          </div>
+          <div className="text-[#555] text-[10px] mt-2">
+            <b>Auto</b> follows your phone orientation: portrait → 90° clockwise, landscape → native.
+            Detection boxes always follow the rotation.
+          </div>
+        </SettingsGroup>
 
         {/* Backend connection */}
         <SettingsGroup title="Backend Server">
@@ -643,12 +891,12 @@ export default function PotholeNetApp() {
   }, [coords?.lat, coords?.lng, gpsSpeed]);
 
   // ── Hazard polling from backend ──
-  const { hazards, nearbyCount } = useHazards(coords, true);
+  const { hazards, nearbyCount, refetch: refetchHazards } = useHazards(coords, true);
 
   // For detection, we need a ref to the video/img element
   const detectTargetRef = useRef<HTMLVideoElement | HTMLImageElement | null>(null);
 
-  const { detections, inferenceMs, modelLoaded } = useDetection(
+  const { detections, inferenceMs, modelLoaded, sourceWidth, sourceHeight } = useDetection(
     detectTargetRef, tab === "camera", settings.detectionThreshold,
     settings.useBackendDetection, gpsSpeed
   );
@@ -663,6 +911,17 @@ export default function PotholeNetApp() {
     const derived = deriveAlertState(detections, gpsSpeed, !cameraOk);
     setScene(derived);
   }, [detections, gpsSpeed, espStreamLive, isESP32, tab, phoneCamError]);
+
+  // Whole-screen edge alert state (ignores potholes):
+  //   red + pulse → human/animal
+  //   orange + pulse → MOVING vehicle
+  //   orange solid → stationary vehicle
+  //   green → all clear
+  // Only updates while the camera tab is running detection.
+  const edgeAlert: EdgeAlertState =
+    tab === "camera"
+      ? deriveEdgeColor(detections)
+      : { color: "green", pulse: false };
 
   useAudioCues(scene, settings.soundsEnabled, settings.voiceCuesEnabled);
   useVibration(scene, settings.hapticsEnabled);
@@ -698,7 +957,6 @@ export default function PotholeNetApp() {
   return (
     <div className="fixed inset-0 bg-[#0a0a0a] flex flex-col overflow-hidden"
       style={{ fontFamily: "system-ui, -apple-system, sans-serif" }}>
-      <div className="landscape-lock" />
 
       {/* Status bar */}
       <div className="flex items-center justify-between px-4 py-2 bg-[#0d0d0d] border-b border-[#1a1a1a]"
@@ -741,15 +999,19 @@ export default function PotholeNetApp() {
         <CameraView settings={settings} scene={scene} espConnected={espConnected}
           mediaRef={detectTargetRef} inferenceMs={inferenceMs} modelLoaded={modelLoaded}
           gpsSpeed={gpsSpeed} onReport={handleReport} onCameraError={setPhoneCamError}
-          onESPStreamReady={setEspStreamLive} />
+          onESPStreamReady={setEspStreamLive}
+          detections={detections} sourceWidth={sourceWidth} sourceHeight={sourceHeight} />
       )}
       {tab === "map" && (
         <MapView
           gpsSpeed={gpsSpeed}
+          gpsCoords={coords}
+          gpsStatus={gpsStatus}
           hazards={hazards}
           nearbyCount={nearbyCount}
           totalReports={backendHealth?.reports_count || 0}
           loading={false}
+          onRefetch={refetchHazards}
         />
       )}
       {tab === "settings" && (
@@ -770,6 +1032,9 @@ export default function PotholeNetApp() {
 
       {/* Tab bar */}
       <TabBar active={tab} onChange={setTab} hazardCount={nearbyCount} />
+
+      {/* Whole-screen edge alert overlay (above everything, pointer-events: none) */}
+      <EdgeAlert state={edgeAlert} />
     </div>
   );
 }

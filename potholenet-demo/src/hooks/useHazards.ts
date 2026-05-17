@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { getHazards } from "../lib/api";
 import type { HazardItem } from "../lib/api";
 
@@ -14,44 +14,38 @@ export function useHazards(
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const coordsRef = useRef(gpsCoords);
+  coordsRef.current = gpsCoords;
+
+  const fetchOnce = useCallback(async () => {
+    const c = coordsRef.current;
+    if (!c) return;
+    setLoading(true);
+    try {
+      // Wide radius so demo seeds within ~5 km still show up
+      const result = await getHazards(c.lat, c.lng, 5000, 1);
+      setHazards(result.hazards);
+      setError(null);
+    } catch (err: any) {
+      setError(err.message || "Failed to fetch hazards");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (!enabled || !gpsCoords) {
       setHazards([]);
       return;
     }
-
-    let mounted = true;
-
-    const fetchHazards = async () => {
-      if (!gpsCoords) return;
-      setLoading(true);
-      try {
-        const result = await getHazards(gpsCoords.lat, gpsCoords.lng, 2000, 1);
-        if (mounted) {
-          setHazards(result.hazards);
-          setError(null);
-        }
-      } catch (err: any) {
-        if (mounted) setError(err.message || "Failed to fetch hazards");
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    };
-
-    // Initial fetch
-    fetchHazards();
-
-    // Poll every 5 seconds
-    intervalRef.current = setInterval(fetchHazards, 5000);
-
+    fetchOnce();
+    intervalRef.current = setInterval(fetchOnce, 5000);
     return () => {
-      mounted = false;
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [gpsCoords?.lat, gpsCoords?.lng, enabled]);
+  }, [gpsCoords?.lat, gpsCoords?.lng, enabled, fetchOnce]);
 
   const nearbyCount = hazards.length;
 
-  return { hazards, nearbyCount, loading, error };
+  return { hazards, nearbyCount, loading, error, refetch: fetchOnce };
 }

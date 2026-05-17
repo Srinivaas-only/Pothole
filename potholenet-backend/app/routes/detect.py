@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models.schemas import DetectionResponse, DetectionCategory, ErrorResponse, DualModeDetectionResponse
 from app.services.detector import annotate_detections, get_detector
+from app.services.hazard_store import create_or_update_report
 from app import main as app_main
 from app.database import get_db
 from app.models.db_models import PotholeDetection
@@ -222,7 +223,7 @@ def save_pothole_detection(db: Session, detection_result: dict, velocity_kmh: Op
         
         db.add(pothole_record)
         db.commit()
-        
+
         logger.info(
             f"Pothole detection saved: "
             f"id={pothole_record.id}, "
@@ -230,7 +231,30 @@ def save_pothole_detection(db: Session, detection_result: dict, velocity_kmh: Op
             f"confidence={confidence:.2f}, "
             f"velocity={velocity_kmh} km/h"
         )
-        
+
+        # Auto-publish to the deduped HazardReport table so it appears on the
+        # in-app map. create_or_update_report bumps severity for any existing
+        # report within DEDUP_RADIUS_M (5m) and DEDUP_WINDOW_DAYS (30d) instead
+        # of inserting a duplicate row. Skip if we don't have GPS coords.
+        if latitude is not None and longitude is not None:
+            try:
+                hazard = create_or_update_report(
+                    db=db,
+                    latitude=latitude,
+                    longitude=longitude,
+                    confidence=float(confidence),
+                    vehicle_type="car",
+                )
+                logger.info(
+                    f"Hazard map updated: id={hazard['report_id']}, "
+                    f"severity={hazard['severity_score']}, "
+                    f"is_new={hazard['is_new']}"
+                )
+            except Exception as e:
+                logger.warning(f"Hazard auto-publish failed (non-fatal): {e}")
+        else:
+            logger.info("Skipping hazard auto-publish — no GPS coords available")
+
     except Exception as e:
         logger.error(f"Failed to save pothole detection: {e}", exc_info=True)
         db.rollback()

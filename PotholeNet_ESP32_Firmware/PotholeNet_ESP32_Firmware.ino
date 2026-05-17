@@ -9,16 +9,16 @@
  *   - All devices (phone, server, ESP32) on the same network
  *   - Streams live camera feed as MJPEG
  *   - Provides single-frame capture for ML detection
- *   - LED flash control, servo control, camera settings
- *   - Captive portal auto-redirects phone to status page
+ *   - Camera settings (brightness, contrast, resolution, etc.)
  *
- * ENDPOINTS:
- *   http://192.168.4.1/              → Status page (HTML)
- *   http://192.168.4.1:81/stream     → MJPEG live stream
- *   http://192.168.4.1/capture       → Single JPEG capture
- *   http://192.168.4.1/control       → Control (LED, servo, camera)
- *   http://192.168.4.1/heartbeat     → JSON status for app
- *   http://192.168.4.1/status        → Detailed JSON diagnostics
+ * ENDPOINTS (replace <IP> with the address shown in Serial Monitor,
+ * or use http://potholenet.local on networks with mDNS support):
+ *   http://<IP>/              → Status page (HTML)
+ *   http://<IP>:81/stream     → MJPEG live stream
+ *   http://<IP>/capture       → Single JPEG capture
+ *   http://<IP>/control       → Camera settings (brightness, resolution, …)
+ *   http://<IP>/heartbeat     → JSON status for app
+ *   http://<IP>/status        → Detailed JSON diagnostics
  *
  * FLASHING (Arduino IDE):
  *   1. Install ESP32 board package:
@@ -54,17 +54,14 @@
 // =========================
 // CONFIGURATION
 // =========================
-const int   AP_CHANNEL  = 6;          // Wi-Fi channel (1-13)
-const int   MAX_CLIENTS = 4;          // Max connected devices
-const int   SERVO_PIN   = 12;         // GPIO12 — only free pin on AI-Thinker
-const bool  ENABLE_SERVO = false;     // Set true if servo is connected
-const int   LED_PIN     = 4;          // Built-in flash LED
+const char* MDNS_NAME    = "potholenet"; // → http://potholenet.local
 
 // Stream settings
-const int   STREAM_PORT = 81;         // MJPEG stream port
-const int   CONTROL_PORT = 80;        // HTTP control port
-const int   JPEG_QUALITY = 10;        // 0-63, lower = better quality
-const int   FRAME_SIZE = FRAMESIZE_VGA; // Default: 640x480
+const int   STREAM_PORT     = 81;     // MJPEG stream port
+const int   CONTROL_PORT    = 80;     // HTTP control port
+const int   JPEG_QUALITY    = 10;     // 0-63, lower = better quality
+const framesize_t FRAME_SIZE = FRAMESIZE_VGA; // Default: 640x480
+const int   STREAM_FPS_CAP  = 25;     // Max MJPEG frames per second
 
 // =========================
 // AI-THINKER ESP32-CAM PIN MAP
@@ -92,13 +89,9 @@ const int   FRAME_SIZE = FRAMESIZE_VGA; // Default: 640x480
 httpd_handle_t stream_httpd  = NULL;
 httpd_handle_t control_httpd = NULL;
 bool cameraReady = false;
+bool wifiConnected = false;
 unsigned long bootTime = 0;
 int streamClients = 0;
-
-// Servo
-#include <ESP32Servo.h>
-Servo myServo;
-int servoAngle = 90;  // Center
 
 // MJPEG boundary
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -280,8 +273,6 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 
 // =========================
 // HANDLER: Control endpoint
-//   /control?led=on|off
-//   /control?servo=left|right|center  (or servo=N for angle 0-180)
 //   /control?brightness=N (-2 to 2)
 //   /control?contrast=N   (-2 to 2)
 //   /control?resolution=VGA|QVGA|CIF
@@ -296,33 +287,6 @@ static esp_err_t control_handler(httpd_req_t *req) {
 
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
     sensor_t *s = esp_camera_sensor_get();
-
-    // LED flash control
-    if (httpd_query_key_value(query, "led", param, sizeof(param)) == ESP_OK) {
-      if (strcmp(param, "on") == 0) {
-        digitalWrite(LED_PIN, HIGH);
-        Serial.println("[CTRL] LED ON");
-      } else {
-        digitalWrite(LED_PIN, LOW);
-        Serial.println("[CTRL] LED OFF");
-      }
-    }
-
-    // Servo control
-    if (httpd_query_key_value(query, "servo", param, sizeof(param)) == ESP_OK) {
-      if (ENABLE_SERVO) {
-        int angle = servoAngle; // default current
-        if (strcmp(param, "left") == 0)  angle = 0;
-        else if (strcmp(param, "right") == 0) angle = 180;
-        else if (strcmp(param, "center") == 0) angle = 90;
-        else angle = atoi(param);  // numeric angle
-
-        angle = constrain(angle, 0, 180);
-        myServo.write(angle);
-        servoAngle = angle;
-        Serial.printf("[CTRL] Servo → %d°\n", angle);
-      }
-    }
 
     // Camera brightness
     if (httpd_query_key_value(query, "brightness", param, sizeof(param)) == ESP_OK) {
@@ -426,8 +390,6 @@ static esp_err_t status_handler(httpd_req_t *req) {
     "\"heap_min\":%lu,"
     "\"camera\":%s,"
     "\"stream_clients\":%d,"
-    "\"servo_angle\":%d,"
-    "\"led\":%d,"
     "\"resolution\":\"VGA\""
     "}",
     ipStr,
@@ -438,9 +400,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
     (unsigned long)ESP.getFreeHeap(),
     (unsigned long)ESP.getMinFreeHeap(),
     cameraReady ? "true" : "false",
-    streamClients,
-    servoAngle,
-    digitalRead(LED_PIN) ? 1 : 0
+    streamClients
   );
   send_json(req, buf);
   return ESP_OK;
@@ -589,22 +549,41 @@ void setup() {
   s->set_lenc(s, 1);            // Lens correction
   s->set_dcw(s, 1);             // Downsize enable
 
-  // ── Servo init ──
-  if (ENABLE_SERVO) {
-    myServo.attach(SERVO_PIN, 500, 2400);
-    myServo.write(servoAngle);
-    Serial.println("[SERVO] Initialized on GPIO12");
+  // ── Wi-Fi Station ──
+  Serial.printf("[WIFI] Connecting to \"%s\"", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);                 // Disable modem sleep for low-latency stream
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
+    delay(500);
+    Serial.print(".");
   }
 
-  // ── Wi-Fi AP ──
-  Serial.println("[WIFI] Starting Access Point...");
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 0, MAX_CLIENTS);
-  IPAddress IP = WiFi.softAPIP();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println();
+    Serial.println("[WIFI] FAILED to connect within 30s.");
+    Serial.println("[WIFI] Check secrets.h SSID/password and that the network is 2.4 GHz.");
+    Serial.println("[WIFI] Restarting in 5s...");
+    delay(5000);
+    ESP.restart();
+  }
 
-  // ── DNS Server for captive portal ──
-  // Redirect all DNS queries to our IP so phone auto-opens portal
-  dnsServer.start(53, "*", IP);
+  wifiConnected = true;
+  IPAddress IP = WiFi.localIP();
+  Serial.println();
+  Serial.printf("[WIFI] Connected! IP: %s (RSSI: %d dBm)\n",
+                IP.toString().c_str(), WiFi.RSSI());
+
+  // ── mDNS so the demo can use http://potholenet.local ──
+  if (MDNS.begin(MDNS_NAME)) {
+    MDNS.addService("http", "tcp", CONTROL_PORT);
+    MDNS.addService("http", "tcp", STREAM_PORT);
+    Serial.printf("[MDNS] Started! Access at http://%s.local\n", MDNS_NAME);
+  } else {
+    Serial.println("[MDNS] Start FAILED — use IP address instead");
+  }
 
   Serial.println();
   Serial.println("╔══════════════════════════════════════╗");
@@ -615,9 +594,9 @@ void setup() {
   char mdnsStr[32];
   snprintf(mdnsStr, sizeof(mdnsStr), "http://%s.local", MDNS_NAME);
   Serial.printf("║  mDNS:     %-25s║\n", mdnsStr);
-  Serial.printf("║  Stream:   http://%s:81/stream  ║\n", IP.toString().c_str());
-  Serial.printf("║  Capture:  http://%s/capture     ║\n", IP.toString().c_str());
-  Serial.printf("║  Heap:     %-5lu bytes free        ║\n", (unsigned long)ESP.getFreeHeap());
+  Serial.printf("║  Stream:   http://%s:81/stream\n", IP.toString().c_str());
+  Serial.printf("║  Capture:  http://%s/capture\n", IP.toString().c_str());
+  Serial.printf("║  Heap:     %lu bytes free\n", (unsigned long)ESP.getFreeHeap());
   Serial.println("╚══════════════════════════════════════╝");
 
   // ── Start HTTP servers ──

@@ -26,36 +26,6 @@ body {
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-/* Landscape lock — shows "Rotate to Portrait" overlay */
-.landscape-lock {
-  display: none;
-}
-
-@media (orientation: landscape) and (max-height: 500px) {
-  .landscape-lock {
-    display: flex;
-    position: fixed;
-    inset: 0;
-    z-index: 9999;
-    background: #0a0a0a;
-    align-items: center;
-    justify-content: center;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .landscape-lock::after {
-    content: "📱";
-    font-size: 48px;
-  }
-  .landscape-lock::before {
-    content: "Rotate to Portrait";
-    color: #666;
-    font-size: 16px;
-    font-weight: 500;
-    order: 1;
-  }
-}
-
 /* Pulse animations for alert border */
 @keyframes pulse-border-slow {
   0%, 100% { opacity: 1; }

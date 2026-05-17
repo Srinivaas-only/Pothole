@@ -8,10 +8,17 @@ const getBackendUrl = (): string => {
     const saved = localStorage.getItem("potholenet:settings");
     if (saved) {
       const parsed = JSON.parse(saved);
-      if (parsed.backendUrl) return parsed.backendUrl.replace(/\/$/, "");
+      const url = (parsed.backendUrl ?? "").trim();
+      // If the page is HTTPS, an http:// backendUrl would be mixed-content blocked.
+      // In that case fall back to same-origin so the Vite proxy handles it.
+      if (typeof window !== "undefined" && window.location.protocol === "https:" && url.startsWith("http://")) {
+        return "";
+      }
+      if (url) return url.replace(/\/$/, "");
     }
   } catch {}
-  return "http://localhost:8000";
+  // Default to same-origin (Vite proxy handles /detect, /reports, /hazards, etc.).
+  return "";
 };
 
 // ============================================
@@ -21,7 +28,14 @@ const getBackendUrl = (): string => {
 export interface DetectionCategory {
   detected: boolean;
   count: number;
-  details: Array<{ confidence: number; label?: string; x?: number; y?: number; width?: number; height?: number }>;
+  details: Array<{
+    confidence: number;
+    label?: string;
+    // Pothole (Roboflow) — center + size
+    x?: number; y?: number; width?: number; height?: number;
+    // YOLO objects — [x1, y1, x2, y2]
+    box?: [number, number, number, number];
+  }>;
 }
 
 export interface DetectionResponse {
@@ -162,6 +176,39 @@ export async function getHazards(
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: "Hazard query failed" }));
     throw new Error(err.detail || `Hazard error ${res.status}`);
+  }
+  return res.json();
+}
+
+/** POST /admin/seed-demo — Insert N sample pothole markers around (lat, lng). */
+export async function seedDemoHazards(
+  lat: number,
+  lng: number,
+  count: number = 8,
+  radiusM: number = 200
+): Promise<{ seeded: number; center: { latitude: number; longitude: number } }> {
+  const url = getBackendUrl();
+  const params = new URLSearchParams({
+    lat: String(lat),
+    lng: String(lng),
+    count: String(count),
+    radius_m: String(radiusM),
+  });
+  const res = await fetch(`${url}/admin/seed-demo?${params}`, { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Seed failed" }));
+    throw new Error(err.detail || `Seed error ${res.status}`);
+  }
+  return res.json();
+}
+
+/** DELETE /admin/seed-demo — Wipe all hazard reports. */
+export async function clearDemoHazards(): Promise<{ deleted: number }> {
+  const url = getBackendUrl();
+  const res = await fetch(`${url}/admin/seed-demo`, { method: "DELETE" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Clear failed" }));
+    throw new Error(err.detail || `Clear error ${res.status}`);
   }
   return res.json();
 }

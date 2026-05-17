@@ -217,9 +217,10 @@ class Detector:
         """
         Run detection in dual-mode.
 
-        REVERSE: YOLO only — detect humans/vehicles/animals behind the car for
-        backup safety alerts; pothole detection skipped (irrelevant at parking speed).
-        DRIVING: full Roboflow pothole detection + YOLO.
+        Both REVERSE and DRIVING modes run YOLO (humans/vehicles/animals) AND
+        Roboflow pothole detection — pothole inference is no longer gated by mode.
+        The `mode` field is still returned so the frontend alert state machine
+        can shape the UI (reverse cues vs. predictive driving cues).
         """
         logger.info(f"Running {mode.upper()} detection")
 
@@ -231,13 +232,10 @@ class Detector:
         try:
             cv2.imwrite(temp_path, img)
             yolo_results = self._run_yolo_detection(temp_path)
-            if mode.lower() == "reverse":
-                pothole_results = {"detected": False, "count": 0, "details": []}
-            else:
-                settings = get_settings()
-                pothole_results = self._run_pothole_detection(
-                    temp_path, settings.POTHOLE_CONFIDENCE_THRESHOLD
-                )
+            settings = get_settings()
+            pothole_results = self._run_pothole_detection(
+                temp_path, settings.POTHOLE_CONFIDENCE_THRESHOLD
+            )
         finally:
             # Clean up temp file
             os.close(temp_fd)
